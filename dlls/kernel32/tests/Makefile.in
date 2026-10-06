@@ -27,6 +27,7 @@ SOURCES = \
 	pipe.c \
 	power.c \
 	process.c \
+	processor.c \
 	profile.c \
 	resource.c \
 	resource.rc \

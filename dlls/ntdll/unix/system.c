@@ -1637,7 +1637,13 @@ static void init_tsc_frequency(void)
     {
         if (system_cpu_mask && !(system_cpu_mask & ((ULONG_PTR)1 << i))) continue;
         snprintf( filename, sizeof(filename), "/sys/devices/system/cpu/cpu%d/cpufreq/base_frequency", i );
-        if (!(f = fopen( filename, "r" ))) break;
+        if (!(f = fopen( filename, "r" )))
+        {
+            /* Some cpufreq drivers expose only the maximum frequency. Use a fixed
+             * scale rather than a changing frequency for cumulative counters. */
+            snprintf( filename, sizeof(filename), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i );
+            if (!(f = fopen( filename, "r" ))) continue;
+        }
         if (fscanf( f, "%lu", &val ) == 1) tsc_from_jiffies[i] = 1000.0 * val / clk_tck;
         fclose( f );
     }
@@ -2721,6 +2727,34 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
 
 #ifdef linux
 
+static NTSTATUS get_cpu_system_cycle_times( ULONG64 *times )
+{
+    ULONG64 values[MAXIMUM_PROCESSORS];
+    unsigned int index = 0, host_index;
+    unsigned long long irq, softirq;
+    char line[512];
+    FILE *f;
+
+    if (cpu_count > ARRAY_SIZE(values)) return STATUS_NOT_SUPPORTED;
+    if (!(f = fopen( "/proc/stat", "r" ))) return STATUS_NOT_SUPPORTED;
+    while (fgets( line, sizeof(line), f ) && index < cpu_count)
+    {
+        /* The aggregate "cpu " row is not a processor record. */
+        if (strncmp( line, "cpu", 3 ) || line[3] < '0' || line[3] > '9') continue;
+        if (sscanf( line, "cpu%u %*u %*u %*u %*u %*u %llu %llu", &host_index, &irq, &softirq ) != 3)
+            continue;
+        if (host_index >= ARRAY_SIZE(tsc_from_jiffies)) continue;
+        if (system_cpu_mask && !(system_cpu_mask & ((ULONG_PTR)1 << host_index))) continue;
+        if (!tsc_from_jiffies[host_index]) break;
+        /* Linux IRQ and softirq time approximate Windows ISR and DPC time. */
+        values[index++] = (irq + softirq) * tsc_from_jiffies[host_index];
+    }
+    fclose( f );
+    if (index != cpu_count) return STATUS_NOT_SUPPORTED;
+    memcpy( times, values, cpu_count * sizeof(*times) );
+    return STATUS_SUCCESS;
+}
+
 static void get_cpu_idle_cycle_times( ULONG64 *times )
 {
     unsigned int index, host_index, count;
@@ -2749,6 +2783,11 @@ static void get_cpu_idle_cycle_times( ULONG64 *times )
     fclose( f );
 }
 #else
+
+static NTSTATUS get_cpu_system_cycle_times( ULONG64 *times )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
 
 static void get_cpu_idle_cycle_times( ULONG64 *times )
 {
@@ -3954,6 +3993,7 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
         break;
     }
 
+    case SystemProcessorCycleTimeInformation: /* 108 */
     case SystemProcessorIdleCycleTimeInformation: /* 83 */
     {
         ULONG group_id = 0; /* FIXME: should probably be current CPU group id. */
@@ -4140,6 +4180,18 @@ NTSTATUS WINAPI NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class,
 
     switch (class)
     {
+    case SystemProcessorCycleTimeInformation:
+        if (!query || query_len < sizeof(USHORT) || *(USHORT *)query) return STATUS_INVALID_PARAMETER;
+        len = cpu_count * sizeof(ULONG64);
+        if (size < len)
+        {
+            ret = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (!info) return STATUS_ACCESS_VIOLATION;
+        ret = get_cpu_system_cycle_times( info );
+        break;
+
     case SystemProcessorIdleCycleTimeInformation:
         len = cpu_count * sizeof(ULONG64);
         if (!query || query_len < sizeof(USHORT) || *(USHORT *)query) return STATUS_INVALID_PARAMETER;
