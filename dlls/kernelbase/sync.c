@@ -245,6 +245,27 @@ void WINAPI DECLSPEC_HOTPATCH QueryUnbiasedInterruptTimePrecise( ULONGLONG *time
 
 
 /***********************************************************************
+ *           GetProcessorSystemCycleTime  (kernelbase.@)
+ */
+BOOL WINAPI GetProcessorSystemCycleTime( USHORT group, SYSTEM_PROCESSOR_CYCLE_TIME_INFORMATION *buffer,
+                                       DWORD *size )
+{
+    ULONG ret_size;
+    NTSTATUS status;
+
+    if (!size)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    status = NtQuerySystemInformationEx( SystemProcessorCycleTimeInformation, &group, sizeof(group),
+                                        buffer, *size, &ret_size );
+    if (!status || status == STATUS_BUFFER_TOO_SMALL) *size = ret_size;
+    return set_ntstatus( status );
+}
+
+
+/***********************************************************************
  *           QueryIdleProcessorCycleTime  (kernelbase.@)
  */
 BOOL WINAPI QueryIdleProcessorCycleTime( ULONG *size, ULONG64 *times )

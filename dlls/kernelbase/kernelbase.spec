@@ -676,7 +676,7 @@
 @ stdcall GetProcessTimes(long ptr ptr ptr ptr)
 @ stdcall GetProcessVersion(long)
 @ stdcall GetProcessWorkingSetSizeEx(long ptr ptr ptr)
-# @ stub GetProcessorSystemCycleTime
+@ stdcall GetProcessorSystemCycleTime(long ptr ptr)
 @ stdcall GetProductInfo(long long long long ptr)
 @ stub GetPtrCalData
 @ stub GetPtrCalDataArray
