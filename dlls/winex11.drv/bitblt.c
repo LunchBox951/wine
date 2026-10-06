@@ -1589,6 +1589,10 @@ struct x11drv_window_surface
     GC                    gc;
     struct x11drv_image  *image;
     BOOL                  byteswap;
+    BOOL                  layered_child;
+    BOOL                  child_clip_valid;
+    RECT                  child_clip;
+    Pixmap                child_shape;
 };
 
 static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
@@ -1785,6 +1789,20 @@ static void x11drv_surface_set_clip( struct window_surface *window_surface, cons
     }
 }
 
+static void sync_layered_child_shape( struct x11drv_window_surface *surface )
+{
+#ifdef HAVE_LIBXSHAPE
+    XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, surface->child_shape, ShapeSet );
+    if (surface->child_clip_valid)
+    {
+        const RECT *clip = &surface->child_clip;
+        XRectangle rect = {clip->left, clip->top, clip->right - clip->left, clip->bottom - clip->top};
+        XShapeCombineRectangles( gdi_display, surface->window, ShapeBounding, 0, 0, &rect,
+                                 IsRectEmpty( clip ) ? 0 : 1, ShapeIntersect, YXBanded );
+    }
+#endif
+}
+
 /***********************************************************************
  *           x11drv_surface_flush
  */
@@ -1832,18 +1850,26 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
     if (shape_changed)
     {
 #ifdef HAVE_LIBXSHAPE
-        if (!shape_bits)
-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, None, ShapeSet );
-        else
+        Pixmap shape = None;
+
+        if (shape_bits)
         {
             struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
             XVisualInfo vis = default_visual;
-            Pixmap shape;
 
             vis.depth = 1;
             shape = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
+        }
+        if (surface->layered_child)
+        {
+            if (surface->child_shape) XFreePixmap( gdi_display, surface->child_shape );
+            surface->child_shape = shape;
+            sync_layered_child_shape( surface );
+        }
+        else
+        {
             XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, shape, ShapeSet );
-            XFreePixmap( gdi_display, shape );
+            if (shape) XFreePixmap( gdi_display, shape );
         }
 #endif /* HAVE_LIBXSHAPE */
     }
@@ -1866,6 +1892,7 @@ static void x11drv_surface_destroy( struct window_surface *window_surface )
     struct x11drv_window_surface *surface = get_x11_surface( window_surface );
 
     TRACE( "freeing %p\n", surface );
+    if (surface->child_shape) XFreePixmap( gdi_display, surface->child_shape );
     if (surface->gc) XFreeGC( gdi_display, surface->gc );
     if (surface->image) x11drv_image_destroy( surface->image );
 }
@@ -1878,11 +1905,27 @@ static const struct window_surface_funcs x11drv_surface_funcs =
     .destroy = x11drv_surface_destroy
 };
 
+/* Flush callbacks hold the surface mutex, so cache ancestor clipping without USER calls. */
+void X11DRV_SetLayeredChildClip( struct window_surface *window_surface, const RECT *clip )
+{
+    struct x11drv_window_surface *surface;
+
+    if (!window_surface || window_surface->funcs != &x11drv_surface_funcs) return;
+    surface = get_x11_surface( window_surface );
+    if (!surface->layered_child) return;
+    pthread_mutex_lock( &window_surface->mutex );
+    surface->child_clip_valid = !!clip;
+    if (clip) surface->child_clip = *clip;
+    sync_layered_child_shape( surface );
+    XFlush( gdi_display );
+    pthread_mutex_unlock( &window_surface->mutex );
+}
+
 /***********************************************************************
  *           create_surface
  */
 static struct window_surface *create_surface( HWND hwnd, Window window, const XVisualInfo *vis, const RECT *rect,
-                                              BOOL use_alpha )
+                                              BOOL use_alpha, BOOL layered_child )
 {
     const XPixmapFormatValues *format = pixmap_formats[vis->depth];
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -1943,6 +1986,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
         surface = get_x11_surface( window_surface );
         surface->image = image;
         surface->byteswap = byteswap;
+        surface->layered_child = layered_child;
         surface->window = window;
         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
         XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
@@ -1969,6 +2013,7 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
 {
     struct window_surface *previous;
     struct x11drv_win_data *data;
+    BOOL layered_child = layered && (NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_CHILD);
 
     TRACE( "hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect( surface_rect ), surface );
 
@@ -1994,7 +2039,7 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     }
 
     *surface = create_surface( data->hwnd, data->whole_window, &data->vis, surface_rect,
-                               layered ? data->use_alpha : FALSE );
+                               layered ? data->use_alpha : FALSE, layered_child );
 
 done:
     release_win_data( data );
