@@ -813,7 +813,7 @@
 @ stdcall -import GetProcessPreferredUILanguages(long ptr ptr ptr)
 @ stdcall -import GetProcessPriorityBoost(long ptr)
 @ stdcall -import GetProcessShutdownParameters(ptr ptr)
-# @ stub GetProcessorSystemCycleTime
+@ stdcall -import GetProcessorSystemCycleTime(long ptr ptr)
 @ stdcall -import GetProcessTimes(long ptr ptr ptr ptr)
 # @ stub GetProcessUserModeExceptionPolicy
 @ stdcall -import GetProcessVersion(long)
