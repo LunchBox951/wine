@@ -3,6 +3,7 @@ IMPORTS   = ole32 version user32 advapi32 winmm
 
 SOURCES = \
 	capture.c \
+	clock.c \
 	dependency.c \
 	mmdevenum.c \
 	propstore.c \
