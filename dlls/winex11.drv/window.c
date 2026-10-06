@@ -1029,6 +1029,10 @@ static void set_mwm_hints( struct x11drv_win_data *data, UINT style, UINT ex_sty
         }
         else mwm_hints.decorations = MWM_DECOR_TITLE | MWM_DECOR_BORDER | MWM_DECOR_MENU | MWM_DECOR_MINIMIZE;
     }
+    else if ((style & WS_CHILD) && data->layered)
+    {
+        mwm_hints.decorations = mwm_hints.functions = 0;
+    }
     else
     {
         mwm_hints.decorations = get_mwm_decorations( data, style, ex_style );
@@ -1109,7 +1113,9 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     HWND owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER );
     Window owner_win = 0;
     XWMHints *wm_hints;
+    BOOL layered_child = (style & WS_CHILD) && data->layered;
 
+    if (layered_child) owner = NtUserGetAncestor( data->hwnd, GA_ROOT );
     if (owner)
     {
         owner = NtUserGetAncestor( owner, GA_ROOT );
@@ -1126,7 +1132,9 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      * only normal windows, and doesn't handle correctly TRANSIENT_FOR hint for
      * dialogs owned by fullscreen windows.
      */
-    if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
+    if (layered_child)
+        window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
+    else if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
     else
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
@@ -1134,7 +1142,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     if ((wm_hints = XAllocWMHints()))
     {
         wm_hints->flags = InputHint | StateHint | WindowGroupHint;
-        wm_hints->input = !use_take_focus && !(style & WS_DISABLED);
+        wm_hints->input = !layered_child && !use_take_focus && !(style & WS_DISABLED);
         wm_hints->initial_state = (style & WS_MINIMIZE) ? IconicState : NormalState;
         wm_hints->window_group = group_leader;
         if (data->icon_pixmap)
@@ -1500,7 +1508,9 @@ static void update_net_wm_states( struct x11drv_win_data *data )
     ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
     if (ex_style & WS_EX_TOPMOST)
         new_state |= (1 << NET_WM_STATE_ABOVE);
-    if (!data->add_taskbar)
+    if ((style & WS_CHILD) && data->layered)
+        new_state |= (1 << NET_WM_STATE_SKIP_TASKBAR) | (1 << NET_WM_STATE_SKIP_PAGER) | (1 << KDE_NET_WM_STATE_SKIP_SWITCHER);
+    else if (!data->add_taskbar)
     {
         if (data->skip_taskbar || (ex_style & WS_EX_NOACTIVATE)
             || (ex_style & WS_EX_TOOLWINDOW && !(ex_style & WS_EX_APPWINDOW)))
@@ -1678,7 +1688,7 @@ static UINT window_update_client_state( struct x11drv_win_data *data )
 {
     UINT old_style = NtUserGetWindowLongW( data->hwnd, GWL_STYLE ), new_style;
 
-    if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
+    if (!data->managed || (NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CHILD)) return 0;
     if (data->desired_state.wm_state == WithdrawnState) return 0; /* ignore state changes on invisible windows */
 
     if (data->wm_state_serial) return 0; /* another WM_STATE update is pending, wait for it to complete */
@@ -1744,7 +1754,7 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
     long old_monitors[4], monitors[4];
     UINT flags;
 
-    if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
+    if (!data->managed || (NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CHILD)) return 0;
     if (is_virtual_desktop()) return 0; /* ignore window manager config changes in virtual desktop mode */
     if (data->desired_state.wm_state != NormalState) return 0; /* ignore config changes on invisible/minimized windows */
 
@@ -1809,6 +1819,8 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
         if ((data = get_win_data( hwnd )))
         {
             if (!--data->state_locks) TRACE( "Unlocked window %p/%lx state\n", data->hwnd, data->whole_window );
+            if (data->layered && (NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CHILD))
+                update_net_wm_states( data );
             window_request_desired_state( data );
             release_win_data( data );
         }
@@ -2510,6 +2522,8 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     if (data->whole_colormap) XFreeColormap( data->display, data->whole_colormap );
     data->whole_window = data->client_window = 0;
     data->whole_colormap = 0;
+    if (data->layered_child_surface) window_surface_release( data->layered_child_surface );
+    data->layered_child_surface = NULL;
     data->managed = FALSE;
 
     memset( &data->desired_state, 0, sizeof(data->desired_state) );
@@ -3259,6 +3273,93 @@ static BOOL get_desired_wm_state( DWORD style, const struct window_rects *rects 
 }
 
 
+/* Layered child surfaces are X11 toplevels so the compositor can blend them. */
+static BOOL sync_layered_child( struct x11drv_win_data *data )
+{
+    struct x11drv_win_data *ancestor;
+    HWND parent, desktop = NtUserGetDesktopWindow();
+    RECT rect = data->rects.visible, clip = rect;
+    BOOL visible;
+    Window owner = 0;
+    DWORD style;
+
+    parent = NtUserGetAncestor( data->hwnd, GA_PARENT );
+    if (!parent || parent == desktop || !data->whole_window || !data->layered) return FALSE;
+    visible = !!(NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_VISIBLE);
+    for (; parent && parent != desktop; parent = NtUserGetAncestor( parent, GA_PARENT ))
+    {
+        style = NtUserGetWindowLongW( parent, GWL_STYLE );
+        if (!(style & WS_VISIBLE) || (style & WS_MINIMIZE)) visible = FALSE;
+        if (!(ancestor = get_win_data( parent ))) return FALSE;
+        OffsetRect( &rect, ancestor->rects.client.left, ancestor->rects.client.top );
+        OffsetRect( &clip, ancestor->rects.client.left, ancestor->rects.client.top );
+        intersect_rect( &clip, &clip, &ancestor->rects.client );
+        if (ancestor->whole_window) owner = ancestor->whole_window;
+        release_win_data( ancestor );
+    }
+    OffsetRect( &clip, -rect.left, -rect.top );
+    X11DRV_SetLayeredChildClip( data->layered_child_surface, &clip );
+    if (owner && managed_mode) window_set_managed( data, TRUE );
+    set_size_hints( data, NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) );
+    update_net_wm_states( data );
+    window_set_config( data, rect, FALSE );
+    window_set_wm_state( data, visible ? NormalState : WithdrawnState, FALSE );
+    XFlush( gdi_display );
+    XFlush( data->display );
+    return TRUE;
+}
+
+static void sync_layered_child_zorder( struct x11drv_win_data *data )
+{
+    struct x11drv_win_data *sibling_data;
+    XWindowChanges changes;
+    HWND sibling;
+    UINT direction;
+
+    if (data->desired_state.wm_state != NormalState) return;
+    for (direction = GW_HWNDNEXT; direction <= GW_HWNDPREV; ++direction)
+    {
+        for (sibling = NtUserGetWindowRelative( data->hwnd, direction ); sibling;
+             sibling = NtUserGetWindowRelative( sibling, direction ))
+        {
+            if (!(sibling_data = get_win_data( sibling ))) continue;
+            changes.sibling = sibling_data->layered && sibling_data->desired_state.wm_state == NormalState
+                              ? sibling_data->whole_window : 0;
+            release_win_data( sibling_data );
+            if (!changes.sibling) continue;
+            changes.stack_mode = direction == GW_HWNDNEXT ? Above : Below;
+            XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen,
+                                  CWSibling | CWStackMode, &changes );
+            XFlush( data->display );
+            return;
+        }
+    }
+}
+
+static void sync_layered_children( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+    NTSTATUS status;
+    HWND *list;
+    ULONG count = 128, i;
+
+    for (;;)
+    {
+        if (!(list = malloc( count * sizeof(*list) ))) return;
+        status = NtUserBuildHwndList( 0, hwnd, TRUE, FALSE, 0, count, list, &count );
+        if (!status) break;
+        free( list );
+        if (status != STATUS_BUFFER_TOO_SMALL) return;
+    }
+    for (i = 0; i + 1 < count; ++i)
+    {
+        if (!(data = get_win_data( list[i] ))) continue;
+        sync_layered_child( data );
+        release_win_data( data );
+    }
+    free( list );
+}
+
 /***********************************************************************
  *		WindowPosChanged   (X11DRV.@)
  */
@@ -3284,6 +3385,30 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     TRACE( "win %p/%lx new_rects %s style %08x flags %08x\n", hwnd, data->whole_window,
            debugstr_window_rects(new_rects), new_style, swp_flags );
 
+    if (data->layered && (new_style & WS_CHILD))
+    {
+        if (surface && surface->hwnd == hwnd && data->layered_child_surface != surface)
+        {
+            window_surface_add_ref( surface );
+            if (data->layered_child_surface) window_surface_release( data->layered_child_surface );
+            data->layered_child_surface = surface;
+        }
+    }
+    else if (data->layered_child_surface)
+    {
+        X11DRV_SetLayeredChildClip( data->layered_child_surface, NULL );
+        window_surface_release( data->layered_child_surface );
+        data->layered_child_surface = NULL;
+    }
+
+    if (sync_layered_child( data ))
+    {
+        sync_layered_child_zorder( data );
+        release_win_data( data );
+        sync_layered_children( hwnd );
+        return;
+    }
+
     /* visible windows are only hidden after SWP_HIDEWINDOW is used */
     if (data->desired_state.wm_state != WithdrawnState && !(new_style & WS_VISIBLE) &&
         !(swp_flags & SWP_HIDEWINDOW))
@@ -3305,6 +3430,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (!data->whole_window)
     {
         release_win_data( data );
+        sync_layered_children( hwnd );
         return;
     }
 
@@ -3341,6 +3467,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     XFlush( data->display );  /* make sure changes are done before we start painting again */
     release_win_data( data );
 
+    sync_layered_children( hwnd );
     if (was_fullscreen) NtUserClipCursor( NULL );
 }
 
